@@ -35,6 +35,10 @@
   display: inline-flex;
 }
 
+.adv-body {
+  display: none;
+}
+
 .adv-body.open {
   display: block;
 }
