@@ -2403,7 +2403,7 @@
               <input type="text" class="form-control input-sm custom-wave-label sm-wave-label-input" maxlength="50" value="Custom Wave" placeholder="e.g. Early Call">
             </div>
             <div class="wave-offset-wrap">
-              <span class="wave-offset-label">${unitLabel}</span>
+              <span class="wave-offset-label"></span>
               <input type="number" class="form-control input-sm custom-wave-offset sm-wave-offset-input" value="15">
               <button type="button" class="btn btn-danger btn-xs btn-remove-wave" title="Remove this wave">
                 <i class="fa fa-trash"></i>
@@ -2417,6 +2417,10 @@
             </div>
           </div>
         `;
+        const offsetLabel = newCard.querySelector(".wave-offset-label");
+        if (offsetLabel) {
+          offsetLabel.textContent = unitLabel;
+        }
         container.appendChild(newCard);
         serializeCustomWaves(type);
       });
