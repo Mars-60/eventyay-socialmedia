@@ -34,13 +34,15 @@
     mastodon: { label: "Mastodon", iconClass: "fa fa-globe", colorClass: "plat-mastodon" },
     telegram: { label: "Telegram", iconClass: "fa fa-paper-plane", colorClass: "plat-telegram" },
     linkedin: { label: "LinkedIn", iconClass: "fa fa-linkedin", colorClass: "plat-linkedin" },
+    bluesky: { label: "Bluesky", iconClass: "fa fa-cloud", colorClass: "plat-bluesky" },
   };
 
   const PLATFORM_LIMITS = {
     twitter: 280,
     mastodon: 500,
     telegram: 4096,
-    linkedin: 3000
+    linkedin: 3000,
+    bluesky: 300,
   };
 
 
@@ -838,6 +840,7 @@
           const net = (link.network || "globe").toLowerCase();
           if (net === "twitter" || net === "x") icon.className = "fa fa-twitter";
           else if (net === "linkedin") icon.className = "fa fa-linkedin";
+          else if (net === "bluesky" || net === "bsky") icon.className = "fa fa-cloud";
           else if (net === "github") icon.className = "fa fa-github";
           else if (net === "telegram") icon.className = "fa fa-telegram";
           else if (net === "instagram") icon.className = "fa fa-instagram";
@@ -881,7 +884,13 @@
           pubBtn.dataset.dbId = p.db_id || "";
           pubBtn.type = "button";
           pubBtn.title = p.status === "failed" ? "Retry publishing" : "Publish now";
-          pubBtn.innerHTML = `<i class="fa fa-paper-plane"></i><span class="action-label">${p.status === "failed" ? "Retry" : "Publish"}</span>`;
+          const pubIcon = document.createElement("i");
+          pubIcon.className = "fa fa-paper-plane";
+          pubBtn.appendChild(pubIcon);
+          const pubLabel = document.createElement("span");
+          pubLabel.className = "action-label";
+          pubLabel.textContent = p.status === "failed" ? "Retry" : "Publish";
+          pubBtn.appendChild(pubLabel);
           actStack.appendChild(pubBtn);
         }
 
@@ -995,8 +1004,14 @@
       header.appendChild(authorBox);
 
       const tag = document.createElement("span");
-      tag.className = `sm-preview-platform-badge platform-badge ${meta.colorClass || ''}`;
-      tag.innerHTML = `${meta.iconClass ? `<i class="${meta.iconClass}"></i> ` : ''}${meta.label || platformKey}`;
+      tag.className = `sm-preview-platform-badge platform-badge ${meta.colorClass || ""}`;
+      if (meta.iconClass) {
+        const iconElem = document.createElement("i");
+        iconElem.className = meta.iconClass;
+        tag.appendChild(iconElem);
+        tag.appendChild(document.createTextNode(" "));
+      }
+      tag.appendChild(document.createTextNode(meta.label || platformKey));
       header.appendChild(tag);
 
       previewBox.appendChild(header);
@@ -1042,6 +1057,7 @@
           const net = (link.network || "globe").toLowerCase();
           if (net === "twitter" || net === "x") icon.className = "fa fa-twitter";
           else if (net === "linkedin") icon.className = "fa fa-linkedin";
+          else if (net === "bluesky" || net === "bsky") icon.className = "fa fa-cloud";
           else if (net === "github") icon.className = "fa fa-github";
           else if (net === "telegram") icon.className = "fa fa-telegram";
           else if (net === "instagram") icon.className = "fa fa-instagram";
@@ -2167,7 +2183,7 @@
     });
 
     // Platform toggle: show/hide per-platform template fields
-    const platformKeys = ["twitter", "mastodon", "telegram", "linkedin"];
+    const platformKeys = ["twitter", "mastodon", "telegram", "linkedin", "bluesky"];
     platformKeys.forEach(platform => {
       const checkbox = document.getElementById(`id_socialmedia_${platform}_enabled`);
       const tplBlock = document.getElementById(`plat-tpls-${platform}`);
@@ -2309,7 +2325,7 @@
     document.querySelectorAll(".reset-default-btn").forEach(btn => {
       btn.addEventListener("click", function () {
         const type = this.dataset.type;
-        const panel = document.getElementById(`custom-tpls-${type}`);
+        const panel = document.getElementById(`custom-plat-${type}`) || document.getElementById(`custom-tpls-${type}`);
         if (panel) {
           panel.querySelectorAll("textarea").forEach(ta => {
             ta.value = "";
@@ -2329,8 +2345,21 @@
       const input = document.getElementById(targetId);
       if (!input || isNaN(limit)) return;
 
+      const isGraphemeCount = targetId.includes("bluesky");
+      const countLength = (val) => {
+        if (!val) return 0;
+        if (isGraphemeCount) {
+          if (typeof Intl !== "undefined" && Intl.Segmenter) {
+            return Array.from(new Intl.Segmenter().segment(val)).length;
+          }
+          return Array.from(val).length;
+        }
+        return val.length;
+      };
+
       const updateBar = () => {
-        const len = input.value.length;
+        const val = input.value || "";
+        const len = countLength(val);
         bar.textContent = `${len} / ${limit} chars`;
         if (len > limit) {
           bar.classList.add("has-error");
@@ -2386,7 +2415,7 @@
               <input type="text" class="form-control input-sm custom-wave-label" maxlength="50" value="Custom Wave" placeholder="e.g. Early Call" style="width: 150px; display: inline-block; height: 26px; padding: 2px 6px;">
             </div>
             <div class="wave-offset-wrap">
-              <span class="wave-offset-label">${unitLabel}</span>
+              <span class="wave-offset-label"></span>
               <input type="number" class="form-control input-sm custom-wave-offset" value="15" style="width: 70px; height: 28px; text-align: center;">
               <button type="button" class="btn btn-danger btn-xs btn-remove-wave" title="Remove this wave">
                 <i class="fa fa-trash"></i>
@@ -2400,6 +2429,10 @@
             </div>
           </div>
         `;
+        const offsetLabelSpan = newCard.querySelector(".wave-offset-label");
+        if (offsetLabelSpan) {
+          offsetLabelSpan.textContent = unitLabel;
+        }
         container.appendChild(newCard);
         serializeCustomWaves(type);
       });
