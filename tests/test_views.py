@@ -887,6 +887,10 @@ def test_publish_post_now_view(logged_in_organizer_client, organizer, event, set
     )
     assert response.status_code == 400
     assert "No active telegram account found" in response.json()["message"]
+    with scope(organizer=organizer, event=event):
+        post.refresh_from_db()
+        assert post.status == SocialMediaPostStatus.FAILED
+        assert post.error_message == "No active telegram account found for organizer."
 
     account = SocialMediaAccount.objects.create(
         organizer=organizer,
@@ -943,3 +947,36 @@ def test_publish_post_now_view(logged_in_organizer_client, organizer, event, set
     )
     assert resp_legacy.status_code == 400
     assert "legacy scheduler integration" in resp_legacy.json()["message"]
+
+
+@pytest.mark.django_db
+def test_publish_post_now_legacy_provider_stays_scheduled(
+    logged_in_organizer_client, organizer, event, settings
+):
+    settings.SITE_URL = "https://testserver"
+    from socialmedia.models import SocialMediaPost, SocialMediaPostStatus
+
+    url = reverse(
+        "plugins:socialmedia:publish_now",
+        kwargs={"organizer": organizer.slug, "event": event.slug},
+    )
+    with scope(organizer=organizer, event=event):
+        post = SocialMediaPost.objects.create(
+            event=event,
+            post_type="cfp",
+            entity_id="cfp_1_buffer",
+            scheduled_at=now(),
+            post_text="Publish now!",
+            status=SocialMediaPostStatus.SCHEDULED,
+        )
+
+    response = logged_in_organizer_client.post(
+        url, data=json.dumps({"db_id": post.pk}), content_type="application/json"
+    )
+    assert response.status_code == 400
+    assert "legacy scheduler integration" in response.json()["message"]
+
+    with scope(organizer=organizer, event=event):
+        post.refresh_from_db()
+        assert post.status == SocialMediaPostStatus.SCHEDULED
+        assert not post.error_message

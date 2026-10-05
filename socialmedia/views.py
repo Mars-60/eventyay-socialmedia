@@ -1175,62 +1175,69 @@ def publish_post_now(request, organizer, event):
                     status=409,
                 )
             db_post = locked_post
+
+            entity_id = db_post.entity_id or ""
+            if any(entity_id.endswith(f"_{prov}") for prov in ["postiz", "buffer"]):
+                return JsonResponse(
+                    {
+                        "success": False,
+                        "message": _(
+                            "Post belongs to a legacy scheduler integration and cannot be published natively. Please export as CSV."
+                        ),
+                    },
+                    status=400,
+                )
+
+            provider_name = None
+            for prov in ["telegram", "mastodon", "twitter", "linkedin"]:
+                if entity_id.endswith(f"_{prov}"):
+                    provider_name = prov
+                    break
+
+            active_accounts = []
+            if provider_name:
+                account = SocialMediaAccount.objects.filter(
+                    organizer=request.event.organizer,
+                    provider=provider_name,
+                    is_active=True,
+                ).first()
+                if account:
+                    active_accounts.append(account)
+            else:
+                active_accounts = list(
+                    SocialMediaAccount.objects.filter(
+                        organizer=request.event.organizer,
+                        provider__in=[
+                            "telegram",
+                            "mastodon",
+                            "twitter",
+                            "linkedin",
+                        ],
+                        is_active=True,
+                    )
+                )
+
+            if not active_accounts:
+                expected_prov = provider_name or "corresponding"
+                db_post.status = SocialMediaPostStatus.FAILED
+                db_post.error_message = (
+                    f"No active {expected_prov} account found for organizer."
+                )
+                db_post.save(update_fields=["status", "error_message", "updated_at"])
+                return JsonResponse(
+                    {
+                        "success": False,
+                        "message": (
+                            f"No active {expected_prov} account "
+                            "found to publish this post."
+                        ),
+                    },
+                    status=400,
+                )
+
             db_post.status = SocialMediaPostStatus.EXPORTED
             db_post.error_message = ""
             db_post.save(update_fields=["status", "error_message", "updated_at"])
-
-        entity_id = db_post.entity_id or ""
-        if any(entity_id.endswith(f"_{prov}") for prov in ["postiz", "buffer"]):
-            return JsonResponse(
-                {
-                    "success": False,
-                    "message": _(
-                        "Post belongs to a legacy scheduler integration and cannot be published natively. Please export as CSV."
-                    ),
-                },
-                status=400,
-            )
-
-        provider_name = None
-        for prov in ["telegram", "mastodon", "twitter", "linkedin"]:
-            if entity_id.endswith(f"_{prov}"):
-                provider_name = prov
-                break
-
-        active_accounts = []
-        if provider_name:
-            account = SocialMediaAccount.objects.filter(
-                organizer=request.event.organizer,
-                provider=provider_name,
-                is_active=True,
-            ).first()
-            if account:
-                active_accounts.append(account)
-        else:
-            active_accounts = list(
-                SocialMediaAccount.objects.filter(
-                    organizer=request.event.organizer,
-                    provider__in=[
-                        "telegram",
-                        "mastodon",
-                        "twitter",
-                        "linkedin",
-                    ],
-                    is_active=True,
-                )
-            )
-
-        if not active_accounts:
-            expected_prov = provider_name or "corresponding"
-            return JsonResponse(
-                {
-                    "success": False,
-                    "message": (
-                        f"No active {expected_prov} account found to publish this post."
-                    ),
-                },
-                status=400,
-            )
 
         errors = []
         published_providers = []
