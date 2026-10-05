@@ -217,7 +217,9 @@ def test_publish_scheduled_posts_auto_publishes_unpinned_posts_when_enabled(
         return_value={"post_id": "123", "url": "https://t.me/123"},
     ) as mock_publish:
         publish_scheduled_posts(sender=None)
-        mock_publish.assert_called_once_with(text="Unpinned auto published post", media=None)
+        mock_publish.assert_called_once_with(
+            text="Unpinned auto published post", media=None
+        )
 
     with scope(organizer=organizer, event=event):
         post.refresh_from_db()
@@ -354,3 +356,264 @@ def test_publish_scheduled_posts_skips_legacy_scheduler_providers(
         post_buffer.refresh_from_db()
         assert post_postiz.status == SocialMediaPostStatus.SCHEDULED
         assert post_buffer.status == SocialMediaPostStatus.SCHEDULED
+
+
+@pytest.mark.django_db
+def test_publish_generic_post_multiple_providers(organizer, event, settings):
+    settings.CELERY_TASK_ALWAYS_EAGER = True
+    # Two different providers
+    acc_tg = SocialMediaAccount.objects.create(
+        organizer=organizer, provider="telegram", platform_username="t1", is_active=True
+    )
+    acc_tg.credentials = {"bot_token": "token"}
+    acc_tg.save()
+
+    acc_mast = SocialMediaAccount.objects.create(
+        organizer=organizer, provider="mastodon", platform_username="m1", is_active=True
+    )
+    acc_mast.credentials = {
+        "client_id": "c",
+        "client_secret": "s",
+        "access_token": "a",
+        "api_base_url": "url",
+    }
+    acc_mast.save()
+
+    with scope(organizer=organizer, event=event):
+        post = SocialMediaPost.objects.create(
+            event=event,
+            post_type="cfp",
+            entity_id="cfp",  # Realistic generic ID
+            scheduled_at=now() - timedelta(minutes=5),
+            post_text="Generic post text",
+            status=SocialMediaPostStatus.SCHEDULED,
+            is_pinned=True,
+        )
+
+    with (
+        patch.object(TelegramProvider, "publish_post") as mock_tg,
+        patch.object(MastodonProvider, "publish_post") as mock_mast,
+    ):
+        publish_scheduled_posts(sender=None)
+        mock_tg.assert_called_once()
+        mock_mast.assert_called_once()
+
+    with scope(organizer=organizer, event=event):
+        post.refresh_from_db()
+        assert post.status == SocialMediaPostStatus.PUBLISHED
+
+
+@pytest.mark.django_db
+def test_publish_generic_post_duplicate_accounts(organizer, event, settings):
+    settings.CELERY_TASK_ALWAYS_EAGER = True
+    acc_tg1 = SocialMediaAccount.objects.create(
+        organizer=organizer,
+        provider="telegram",
+        platform_username="tg1",
+        is_active=True,
+    )
+    acc_tg1.credentials = {"bot_token": "t1"}
+    acc_tg1.save()
+
+    acc_tg2 = SocialMediaAccount.objects.create(
+        organizer=organizer,
+        provider="telegram",
+        platform_username="tg2",
+        is_active=True,
+    )
+    acc_tg2.credentials = {"bot_token": "t2"}
+    acc_tg2.save()
+
+    acc_tg3_inactive = SocialMediaAccount.objects.create(
+        organizer=organizer,
+        provider="telegram",
+        platform_username="tg3",
+        is_active=False,
+    )
+    acc_tg3_inactive.credentials = {"bot_token": "t3"}
+    acc_tg3_inactive.save()
+
+    with scope(organizer=organizer, event=event):
+        post = SocialMediaPost.objects.create(
+            event=event,
+            post_type="schedule",
+            entity_id="schedule",
+            scheduled_at=now() - timedelta(minutes=5),
+            post_text="Multiple accounts test",
+            status=SocialMediaPostStatus.SCHEDULED,
+            is_pinned=True,
+        )
+
+    with patch.object(TelegramProvider, "publish_post") as mock_tg:
+        publish_scheduled_posts(sender=None)
+        assert mock_tg.call_count == 2
+
+    with scope(organizer=organizer, event=event):
+        post.refresh_from_db()
+        assert post.status == SocialMediaPostStatus.PUBLISHED
+
+
+@pytest.mark.django_db
+def test_publish_generic_post_partial_failure(organizer, event, settings):
+    settings.CELERY_TASK_ALWAYS_EAGER = True
+    acc_tg = SocialMediaAccount.objects.create(
+        organizer=organizer, provider="telegram", platform_username="t1", is_active=True
+    )
+    acc_tg.credentials = {"bot_token": "token"}
+    acc_tg.save()
+
+    acc_mast = SocialMediaAccount.objects.create(
+        organizer=organizer, provider="mastodon", platform_username="m1", is_active=True
+    )
+    acc_mast.credentials = {
+        "client_id": "c",
+        "client_secret": "s",
+        "access_token": "a",
+        "api_base_url": "url",
+    }
+    acc_mast.save()
+
+    with scope(organizer=organizer, event=event):
+        post = SocialMediaPost.objects.create(
+            event=event,
+            post_type="ticket",
+            entity_id="ticket_123",
+            scheduled_at=now() - timedelta(minutes=5),
+            post_text="Partial failure text",
+            status=SocialMediaPostStatus.SCHEDULED,
+            is_pinned=True,
+        )
+
+    with (
+        patch.object(TelegramProvider, "publish_post") as mock_tg,
+        patch.object(
+            MastodonProvider, "publish_post", side_effect=Exception("Network timeout")
+        ) as mock_mast,
+    ):
+        publish_scheduled_posts(sender=None)
+        mock_tg.assert_called_once()
+        mock_mast.assert_called_once()
+
+    with scope(organizer=organizer, event=event):
+        post.refresh_from_db()
+        assert post.status == SocialMediaPostStatus.FAILED
+        assert "Published to (telegram)" in post.error_message
+        assert "mastodon: Network timeout" in post.error_message
+
+
+@pytest.mark.django_db
+def test_publish_generic_post_all_failure(organizer, event, settings):
+    settings.CELERY_TASK_ALWAYS_EAGER = True
+    acc_tg = SocialMediaAccount.objects.create(
+        organizer=organizer, provider="telegram", platform_username="t1", is_active=True
+    )
+    acc_tg.credentials = {"bot_token": "token"}
+    acc_tg.save()
+
+    with scope(organizer=organizer, event=event):
+        post = SocialMediaPost.objects.create(
+            event=event,
+            post_type="speaker",
+            entity_id="speaker_1_2",
+            scheduled_at=now() - timedelta(minutes=5),
+            post_text="All fail text",
+            status=SocialMediaPostStatus.SCHEDULED,
+            is_pinned=True,
+        )
+
+    with patch.object(
+        TelegramProvider, "publish_post", side_effect=Exception("Auth error")
+    ) as mock_tg:
+        publish_scheduled_posts(sender=None)
+        mock_tg.assert_called_once()
+
+    with scope(organizer=organizer, event=event):
+        post.refresh_from_db()
+        assert post.status == SocialMediaPostStatus.FAILED
+        assert "telegram: Auth error" in post.error_message
+
+
+@pytest.mark.django_db
+def test_publish_generic_post_zero_accounts(organizer, event, settings):
+    settings.CELERY_TASK_ALWAYS_EAGER = True
+    # Zero accounts setup
+    with scope(organizer=organizer, event=event):
+        post = SocialMediaPost.objects.create(
+            event=event,
+            post_type="session",
+            entity_id="session_1",
+            scheduled_at=now() - timedelta(minutes=5),
+            post_text="No accounts",
+            status=SocialMediaPostStatus.SCHEDULED,
+            is_pinned=True,
+        )
+
+    with patch("socialmedia.signals.publish_generic_post") as mock_task:
+        publish_scheduled_posts(sender=None)
+        mock_task.assert_not_called()
+
+    with scope(organizer=organizer, event=event):
+        post.refresh_from_db()
+        assert post.status == SocialMediaPostStatus.SCHEDULED
+
+
+@pytest.mark.django_db
+def test_publish_generic_post_duplicate_execution(organizer, event, settings):
+    settings.CELERY_TASK_ALWAYS_EAGER = True
+    acc_tg = SocialMediaAccount.objects.create(
+        organizer=organizer, provider="telegram", platform_username="t1", is_active=True
+    )
+    acc_tg.credentials = {"bot_token": "token"}
+    acc_tg.save()
+
+    with scope(organizer=organizer, event=event):
+        post = SocialMediaPost.objects.create(
+            event=event,
+            post_type="cfp",
+            entity_id="cfp",
+            scheduled_at=now() - timedelta(minutes=5),
+            post_text="Dup test",
+            status=SocialMediaPostStatus.SCHEDULED,
+            is_pinned=True,
+        )
+
+    from socialmedia.tasks import publish_generic_post
+
+    with patch.object(TelegramProvider, "publish_post") as mock_tg:
+        publish_generic_post(post.pk)
+        assert mock_tg.call_count == 1
+
+        # Second execution should do nothing
+        publish_generic_post(post.pk)
+        assert mock_tg.call_count == 1
+
+
+@pytest.mark.django_db
+def test_publish_unsupported_suffix_skipped(organizer, event, settings):
+    settings.CELERY_TASK_ALWAYS_EAGER = True
+    acc_tg = SocialMediaAccount.objects.create(
+        organizer=organizer, provider="telegram", platform_username="t1", is_active=True
+    )
+    acc_tg.credentials = {"bot_token": "token"}
+    acc_tg.save()
+
+    with scope(organizer=organizer, event=event):
+        post = SocialMediaPost.objects.create(
+            event=event,
+            post_type="cfp",
+            entity_id="cfp_bluesky",  # Unsupported suffix
+            scheduled_at=now() - timedelta(minutes=5),
+            post_text="Unsupported suffix test",
+            status=SocialMediaPostStatus.SCHEDULED,
+            is_pinned=True,
+        )
+
+    with patch("socialmedia.signals.publish_generic_post") as mock_task, \
+         patch("socialmedia.signals.publish_single_post") as mock_single:
+        publish_scheduled_posts(sender=None)
+        mock_task.assert_not_called()
+        mock_single.assert_not_called()
+
+    with scope(organizer=organizer, event=event):
+        post.refresh_from_db()
+        assert post.status == SocialMediaPostStatus.SCHEDULED
