@@ -144,6 +144,65 @@ def control_dashboard_socialmedia(sender, request=None, **kwargs):
 
 logger = logging.getLogger(__name__)
 
+def get_active_direct_accounts(organizer) -> "QuerySet[SocialMediaAccount]":
+    """Return a deterministic QuerySet of active direct-publishing accounts for the given organizer."""
+    return SocialMediaAccount.objects.filter(
+        organizer=organizer,
+        provider__in=DIRECT_PUBLISH_PROVIDERS,
+        is_active=True,
+    ).order_by("pk")
+
+
+def claim_and_resolve_generic_post(
+    post_pk: int,
+) -> tuple[SocialMediaPost | None, list[SocialMediaAccount]]:
+    """Atomically claim a generic scheduled post and resolve its applicable accounts.
+
+    Transitions status to EXPORTED if active accounts exist.
+    If no active accounts exist, transitions directly to FAILED.
+    """
+    logger.debug("Attempting to claim generic post %s.", post_pk)
+    with transaction.atomic():
+        locked_post = (
+            SocialMediaPost.objects.filter(
+                pk=post_pk,
+                status__in=[
+                    SocialMediaPostStatus.SCHEDULED,
+                    # We only allow SCHEDULED here since scheduler doesn't dispatch FAILED.
+                ],
+            )
+            .select_for_update(skip_locked=True)
+            .first()
+        )
+        if not locked_post:
+            logger.info("Generic post %s could not be locked for publishing.", post_pk)
+            return None, []
+
+        active_accounts = list(get_active_direct_accounts(locked_post.event.organizer))
+
+        if not active_accounts:
+            locked_post.status = SocialMediaPostStatus.FAILED
+            locked_post.error_message = (
+                "No active direct provider accounts found for organizer."
+            )
+            locked_post.save(update_fields=["status", "error_message", "updated_at"])
+            logger.warning(
+                "Generic post %s marked as FAILED: No active direct accounts found for organizer '%s'.",
+                post_pk,
+                locked_post.event.organizer.slug,
+            )
+            return None, []
+
+        locked_post.status = SocialMediaPostStatus.EXPORTED
+        locked_post.error_message = ""
+        locked_post.save(update_fields=["status", "error_message", "updated_at"])
+        logger.info(
+            "Generic post %s successfully claimed (status transitioned to EXPORTED).",
+            post_pk,
+        )
+
+        return locked_post, active_accounts
+
 
 def claim_post_for_publishing(post_pk: int, provider_name: str):
     """Atomically claim a scheduled or failed post for publishing.
@@ -210,7 +269,7 @@ def publish_scheduled_posts(sender, **kwargs):
     for direct native platform integrations (Telegram, Mastodon, Twitter/X, LinkedIn).
     Dispatches execution to dedicated Celery tasks off the main beat worker.
     """
-    from .tasks import publish_single_post
+    from .tasks import publish_generic_post, publish_single_post
 
     due_posts = (
         SocialMediaPost.objects.select_related("event", "event__organizer")
@@ -241,6 +300,16 @@ def publish_scheduled_posts(sender, **kwargs):
             continue
 
         entity_id = post.entity_id or ""
+
+        # Explicitly determine if a post is generic vs suffixed from its original parsed representation.
+        # A generic base_id is purely alphabetic (e.g. 'cfp', 'schedule') or ends in a numeric ID (e.g. 'ticket_123').
+        # A suffixed post appends a platform name (e.g. 'cfp_twitter', 'ticket_123_hootsuite').
+        is_generic = True
+        if "_" in entity_id:
+            suffix = entity_id.rsplit("_", 1)[-1]
+            if not suffix.isdigit():
+                is_generic = False
+
         if any(entity_id.endswith(f"_{prov}") for prov in LEGACY_SCHEDULER_PROVIDERS):
             logger.debug(
                 "Skipping post %s (entity '%s'): belongs to legacy external scheduler provider.",
@@ -255,39 +324,42 @@ def publish_scheduled_posts(sender, **kwargs):
                 provider_names = [prov]
                 break
 
-        if not provider_names:
-            # Fallback: check which direct integrations are active for this organizer
-            active_provs = list(
-                SocialMediaAccount.objects.filter(
-                    organizer=post.event.organizer,
-                    provider__in=DIRECT_PUBLISH_PROVIDERS,
-                    is_active=True,
+        if is_generic:
+            # Generic/provider-less post: attempt to dispatch exactly ONE generic task
+            if not get_active_direct_accounts(post.event.organizer).exists():
+                logger.warning(
+                    "Post %s (event '%s', scheduled for %s) has no active direct providers configured.",
+                    post.pk,
+                    post.event.slug,
+                    post.scheduled_at,
                 )
-                .values_list("provider", flat=True)
-                .distinct()
-            )
-            provider_names = active_provs
+                continue
 
-        if not provider_names:
-            logger.warning(
-                "Post %s (event '%s', scheduled for %s) has no active direct providers configured.",
-                post.pk,
-                post.event.slug,
-                post.scheduled_at,
-            )
-            continue
-
-        for provider_name in provider_names:
             is_eager = getattr(settings, "CELERY_TASK_ALWAYS_EAGER", False) or getattr(
                 settings, "CELERY_ALWAYS_EAGER", False
             )
             logger.info(
-                "Dispatching publish_single_post for post %s to provider %s (eager=%s).",
+                "Dispatching publish_generic_post for generic post %s (eager=%s).",
                 post.pk,
-                provider_name,
                 is_eager,
             )
+
             if is_eager:
-                publish_single_post(post.pk, provider_name)
+                publish_generic_post(post.pk)
             else:
-                publish_single_post.apply_async(args=[post.pk, provider_name])
+                publish_generic_post.apply_async(args=[post.pk])
+        else:
+            for provider_name in provider_names:
+                is_eager = getattr(
+                    settings, "CELERY_TASK_ALWAYS_EAGER", False
+                ) or getattr(settings, "CELERY_ALWAYS_EAGER", False)
+                logger.info(
+                    "Dispatching publish_single_post for post %s to provider %s (eager=%s).",
+                    post.pk,
+                    provider_name,
+                    is_eager,
+                )
+                if is_eager:
+                    publish_single_post(post.pk, provider_name)
+                else:
+                    publish_single_post.apply_async(args=[post.pk, provider_name])
