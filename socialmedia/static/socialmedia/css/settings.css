@@ -107,6 +107,10 @@
   gap: 8px;
 }
 
+.adv-group-title.sm-flex-between {
+  justify-content: space-between;
+}
+
 .sm-section-title i,
 .adv-group-title i {
   color: #3b82f6;
