@@ -2,11 +2,11 @@ name: Tests
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, dev ]
     paths-ignore:
       - 'socialmedia/locale/**'
   pull_request:
-    branches: [ main, master ]
+    branches: [ main, master, dev ]
     paths-ignore:
       - 'socialmedia/locale/**'
 

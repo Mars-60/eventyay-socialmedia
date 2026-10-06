@@ -2,12 +2,12 @@ name: Code Style
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, dev ]
     paths-ignore:
       - 'socialmedia/locale/**'
       - 'socialmedia/static/**'
   pull_request:
-    branches: [ main, master ]
+    branches: [ main, master, dev ]
     paths-ignore:
       - 'socialmedia/locale/**'
       - 'socialmedia/static/**'

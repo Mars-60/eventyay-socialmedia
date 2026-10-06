@@ -217,6 +217,20 @@ class SocialMediaPostSettingsView(DecoupleMixin, FormView):
                 "event": self.request.event.slug,
             },
         )
+        ctx["posts_url"] = reverse(
+            "plugins:socialmedia:index",
+            kwargs={
+                "organizer": self.request.event.organizer.slug,
+                "event": self.request.event.slug,
+            },
+        )
+        ctx["accounts_url"] = (
+            reverse(
+                "plugins:socialmedia:organizer_accounts",
+                kwargs={"organizer": self.request.event.organizer.slug},
+            )
+            + f"?event={self.request.event.slug}"
+        )
         return ctx
 
     @transaction.atomic
@@ -304,8 +318,16 @@ class SocialMediaTemplatesView(DecoupleMixin, FormView):
             },
         )
 
+        ctx["accounts_url"] = (
+            reverse(
+                "plugins:socialmedia:organizer_accounts",
+                kwargs={"organizer": self.request.event.organizer.slug},
+            )
+            + f"?event={self.request.event.slug}"
+        )
+
         enabled_platforms = []
-        for p in ["twitter", "linkedin", "telegram", "mastodon"]:
+        for p in ["twitter", "linkedin", "telegram", "mastodon", "bluesky"]:
             is_enabled = self.request.event.settings.get(
                 f"socialmedia_{p}_enabled", as_type=bool, default=False
             )
@@ -396,6 +418,7 @@ class SocialMediaTemplatesView(DecoupleMixin, FormView):
     @transaction.atomic
     def form_valid(self, form):
         import json
+
         from .export import CONTENT_TYPE_WAVES
 
         self._save_decoupled(form)
@@ -405,7 +428,7 @@ class SocialMediaTemplatesView(DecoupleMixin, FormView):
         for ptype, waves in CONTENT_TYPE_WAVES.items():
             active_offs = []
             has_wave_setting = False
-            for wkey, wlabel, def_off, wunit in waves:
+            for wkey, _wlabel, def_off, _wunit in waves:
                 en_key = f"socialmedia_{ptype}_{wkey}_enabled"
                 off_key = f"socialmedia_{ptype}_{wkey}_offset"
                 if en_key in form.cleaned_data:
@@ -603,7 +626,7 @@ def preview_posts(request, organizer, event):
             # Determine platform & connected account details (Issue #61)
             platform = p.get("platform", "")
             if not platform:
-                for prov in ["twitter", "linkedin", "telegram", "mastodon"]:
+                for prov in ["twitter", "linkedin", "telegram", "mastodon", "bluesky"]:
                     if entity_id.endswith(f"_{prov}"):
                         platform = prov
                         break
@@ -1175,63 +1198,70 @@ def publish_post_now(request, organizer, event):
                     status=409,
                 )
             db_post = locked_post
+
+            entity_id = db_post.entity_id or ""
+            if any(entity_id.endswith(f"_{prov}") for prov in ["postiz", "buffer"]):
+                return JsonResponse(
+                    {
+                        "success": False,
+                        "message": _(
+                            "Post belongs to a legacy scheduler integration and cannot be published natively. Please export as CSV."
+                        ),
+                    },
+                    status=400,
+                )
+
+            provider_name = None
+            for prov in ["telegram", "mastodon", "twitter", "linkedin", "bluesky"]:
+                if entity_id.endswith(f"_{prov}"):
+                    provider_name = prov
+                    break
+
+            active_accounts = []
+            if provider_name:
+                account = SocialMediaAccount.objects.filter(
+                    organizer=request.event.organizer,
+                    provider=provider_name,
+                    is_active=True,
+                ).first()
+                if account:
+                    active_accounts.append(account)
+            else:
+                active_accounts = list(
+                    SocialMediaAccount.objects.filter(
+                        organizer=request.event.organizer,
+                        provider__in=[
+                            "telegram",
+                            "mastodon",
+                            "twitter",
+                            "linkedin",
+                            "bluesky",
+                        ],
+                        is_active=True,
+                    )
+                )
+
+            if not active_accounts:
+                expected_prov = provider_name or "corresponding"
+                db_post.status = SocialMediaPostStatus.FAILED
+                db_post.error_message = (
+                    f"No active {expected_prov} account found for organizer."
+                )
+                db_post.save(update_fields=["status", "error_message", "updated_at"])
+                return JsonResponse(
+                    {
+                        "success": False,
+                        "message": (
+                            f"No active {expected_prov} account "
+                            "found to publish this post."
+                        ),
+                    },
+                    status=400,
+                )
+
             db_post.status = SocialMediaPostStatus.EXPORTED
             db_post.error_message = ""
             db_post.save(update_fields=["status", "error_message", "updated_at"])
-
-        entity_id = db_post.entity_id or ""
-        if any(entity_id.endswith(f"_{prov}") for prov in ["postiz", "buffer"]):
-            return JsonResponse(
-                {
-                    "success": False,
-                    "message": _(
-                        "Post belongs to a legacy scheduler integration and cannot be published natively. Please export as CSV."
-                    ),
-                },
-                status=400,
-            )
-
-        provider_name = None
-        for prov in ["telegram", "mastodon", "twitter", "linkedin"]:
-            if entity_id.endswith(f"_{prov}"):
-                provider_name = prov
-                break
-
-        active_accounts = []
-        if provider_name:
-            account = SocialMediaAccount.objects.filter(
-                organizer=request.event.organizer,
-                provider=provider_name,
-                is_active=True,
-            ).first()
-            if account:
-                active_accounts.append(account)
-        else:
-            active_accounts = list(
-                SocialMediaAccount.objects.filter(
-                    organizer=request.event.organizer,
-                    provider__in=[
-                        "telegram",
-                        "mastodon",
-                        "twitter",
-                        "linkedin",
-                    ],
-                    is_active=True,
-                )
-            )
-
-        if not active_accounts:
-            expected_prov = provider_name or "corresponding"
-            return JsonResponse(
-                {
-                    "success": False,
-                    "message": (
-                        f"No active {expected_prov} account found to publish this post."
-                    ),
-                },
-                status=400,
-            )
-
         errors = []
         published_providers = []
 

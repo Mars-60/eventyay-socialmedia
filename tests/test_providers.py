@@ -3,14 +3,19 @@ from unittest.mock import MagicMock, mock_open, patch
 import pytest
 
 from socialmedia.models import SocialMediaAccount
-from socialmedia.providers import (
+from socialmedia.providers.base import (
     BaseSocialProvider,
     PublishingError,
-    get_provider,
-    get_provider_class,
+    _safe_fetch_url,
+)
+from socialmedia.providers.bluesky import (
+    BlueskyProvider,
+    _count_graphemes,
+    extract_atproto_facets,
 )
 from socialmedia.providers.linkedin import LinkedInProvider
 from socialmedia.providers.mastodon import MastodonProvider
+from socialmedia.providers.registry import get_provider, get_provider_class
 from socialmedia.providers.telegram import TelegramProvider
 from socialmedia.providers.twitter import TwitterProvider
 
@@ -37,6 +42,7 @@ def test_registry_get_provider_class():
     assert get_provider_class("mastodon") == MastodonProvider
     assert get_provider_class("twitter") == TwitterProvider
     assert get_provider_class("linkedin") == LinkedInProvider
+    assert get_provider_class("bluesky") == BlueskyProvider
     with pytest.raises(ValueError):
         get_provider_class("postiz")
     with pytest.raises(ValueError):
@@ -306,3 +312,437 @@ def test_linkedin_publish_post(mock_post, mock_account):
     res = provider.publish_post("Hello LinkedIn")
     assert res["post_id"] == "urn:li:share:67890"
     assert res["url"] == "https://www.linkedin.com/feed/update/urn:li:share:67890"
+
+
+# ---------------------------------------------------------------------------
+# Bluesky Provider Tests
+# ---------------------------------------------------------------------------
+
+
+def test_bluesky_extract_atproto_facets():
+    # Plain text without links or tags
+    assert extract_atproto_facets("Just plain text") == []
+
+    # Text with URL and hashtags
+    text = "Join us at https://eventyay.com for #fossasia and #tech!"
+    facets = extract_atproto_facets(text)
+    assert len(facets) == 3
+
+    # Link facet
+    link = facets[0]
+    assert link["features"][0]["$type"] == "app.bsky.richtext.facet#link"
+    assert link["features"][0]["uri"] == "https://eventyay.com"
+
+    # Tag facets
+    tag_1 = facets[1]
+    assert tag_1["features"][0]["$type"] == "app.bsky.richtext.facet#tag"
+    assert tag_1["features"][0]["tag"] == "fossasia"
+
+    tag_2 = facets[2]
+    assert tag_2["features"][0]["$type"] == "app.bsky.richtext.facet#tag"
+    assert tag_2["features"][0]["tag"] == "tech"
+
+
+def test_bluesky_extract_atproto_facets_utf8_multibyte():
+    # Text with emoji / unicode characters (multi-byte in UTF-8)
+    text = "🎉 Hello 🚀 https://eventyay.com #conference"
+    facets = extract_atproto_facets(text)
+    assert len(facets) == 2
+
+    link_facet = facets[0]
+    byte_start = link_facet["index"]["byteStart"]
+    byte_end = link_facet["index"]["byteEnd"]
+    assert text.encode("utf-8")[byte_start:byte_end] == b"https://eventyay.com"
+
+    tag_facet = facets[1]
+    byte_start_t = tag_facet["index"]["byteStart"]
+    byte_end_t = tag_facet["index"]["byteEnd"]
+    assert text.encode("utf-8")[byte_start_t:byte_end_t] == b"#conference"
+
+
+def test_bluesky_extract_atproto_facets_punctuation_and_unicode():
+    text = "Welcome (#fossasia)! Join us at #café, #événement & (#summit2026)."
+    facets = extract_atproto_facets(text)
+    tags = [
+        f["features"][0]["tag"]
+        for f in facets
+        if f["features"][0]["$type"] == "app.bsky.richtext.facet#tag"
+    ]
+    assert tags == ["fossasia", "café", "événement", "summit2026"]
+
+    # Verify byte ranges match exactly
+    for facet in facets:
+        b_start = facet["index"]["byteStart"]
+        b_end = facet["index"]["byteEnd"]
+        matched_bytes = text.encode("utf-8")[b_start:b_end]
+        assert matched_bytes.startswith(b"#")
+
+
+@patch("requests.post")
+def test_bluesky_validate_credentials(mock_post, mock_account):
+    mock_account.provider = "bluesky"
+    mock_account.platform_username = "@test.bsky.social"
+    mock_account.credentials = {
+        "handle": "test.bsky.social",
+        "app_password": "fake-app-password",
+        "pds_url": "https://bsky.social",
+    }
+    provider = BlueskyProvider(mock_account)
+
+    # Valid
+    res_ok = MagicMock()
+    res_ok.status_code = 200
+    res_ok.json.return_value = {
+        "accessJwt": "fake_jwt",
+        "did": "did:plc:12345",
+        "handle": "test.bsky.social",
+    }
+    mock_post.return_value = res_ok
+    assert provider.validate_credentials() is True
+
+    # Invalid (e.g. 401 Authentication Required)
+    res_err = MagicMock()
+    res_err.status_code = 401
+    res_err.json.return_value = {"message": "Invalid identifier or password"}
+    mock_post.return_value = res_err
+    assert provider.validate_credentials() is False
+
+
+@patch("requests.post")
+def test_bluesky_publish_post_text_only(mock_post, mock_account):
+    mock_account.provider = "bluesky"
+    mock_account.platform_username = "@test.bsky.social"
+    mock_account.credentials = {
+        "handle": "test.bsky.social",
+        "app_password": "fake-app-password",
+        "pds_url": "https://bsky.social",
+    }
+    provider = BlueskyProvider(mock_account)
+
+    # 1. createSession response
+    res_session = MagicMock()
+    res_session.status_code = 200
+    res_session.json.return_value = {
+        "accessJwt": "fake_jwt",
+        "did": "did:plc:12345",
+        "handle": "test.bsky.social",
+    }
+
+    # 2. createRecord response
+    res_record = MagicMock()
+    res_record.status_code = 200
+    res_record.json.return_value = {
+        "uri": "at://did:plc:12345/app.bsky.feed.post/3l7example",
+        "cid": "bafyreiexample",
+    }
+
+    mock_post.side_effect = [res_session, res_record]
+
+    res = provider.publish_post("Hello Bluesky from https://eventyay.com #eventyay")
+    assert res["post_id"] == "3l7example"
+    assert res["url"] == "https://bsky.app/profile/test.bsky.social/post/3l7example"
+
+    # Verify createRecord payload
+    create_call = mock_post.call_args_list[1]
+    payload = create_call.kwargs["json"]
+    assert payload["repo"] == "did:plc:12345"
+    assert payload["collection"] == "app.bsky.feed.post"
+    assert (
+        payload["record"]["text"] == "Hello Bluesky from https://eventyay.com #eventyay"
+    )
+    assert len(payload["record"]["facets"]) == 2
+
+
+@patch("socialmedia.providers.bluesky._safe_fetch_url")
+@patch("requests.post")
+def test_bluesky_publish_post_with_media(mock_post, mock_fetch, mock_account):
+    mock_account.provider = "bluesky"
+    mock_account.platform_username = "@test.bsky.social"
+    mock_account.credentials = {
+        "handle": "test.bsky.social",
+        "app_password": "fake-app-password",
+        "pds_url": "https://bsky.social",
+    }
+    provider = BlueskyProvider(mock_account)
+
+    # 1. createSession response
+    res_session = MagicMock()
+    res_session.status_code = 200
+    res_session.json.return_value = {
+        "accessJwt": "fake_jwt",
+        "did": "did:plc:12345",
+        "handle": "test.bsky.social",
+    }
+
+    # Mock media fetch
+    res_fetch = MagicMock()
+    res_fetch.content = b"fake_image_bytes"
+    res_fetch.headers = {"Content-Type": "image/png"}
+    mock_fetch.return_value = res_fetch
+
+    # 2. uploadBlob response
+    res_blob = MagicMock()
+    res_blob.status_code = 200
+    res_blob.json.return_value = {
+        "blob": {
+            "$type": "blob",
+            "ref": {"$link": "blob_cid_123"},
+            "mimeType": "image/png",
+            "size": 16,
+        }
+    }
+
+    # 3. createRecord response
+    res_record = MagicMock()
+    res_record.status_code = 200
+    res_record.json.return_value = {
+        "uri": "at://did:plc:12345/app.bsky.feed.post/3l7mediaexample",
+        "cid": "bafyreiimage",
+    }
+
+    mock_post.side_effect = [res_session, res_blob, res_record]
+
+    res = provider.publish_post(
+        "Bluesky with photo",
+        media=["https://example.com/speaker.png"],
+    )
+    assert res["post_id"] == "3l7mediaexample"
+    assert (
+        res["url"] == "https://bsky.app/profile/test.bsky.social/post/3l7mediaexample"
+    )
+
+    # Verify uploadBlob was called with correct auth
+    upload_call = mock_post.call_args_list[1]
+    assert upload_call.kwargs["headers"]["Authorization"] == "Bearer fake_jwt"
+    assert upload_call.kwargs["headers"]["Content-Type"] == "image/png"
+    assert upload_call.kwargs["data"] == b"fake_image_bytes"
+
+    # Verify createRecord has embed images
+    create_call = mock_post.call_args_list[2]
+    payload = create_call.kwargs["json"]
+    assert "embed" in payload["record"]
+    assert payload["record"]["embed"]["$type"] == "app.bsky.embed.images"
+    assert len(payload["record"]["embed"]["images"]) == 1
+
+
+@patch("requests.post")
+def test_bluesky_send_test_message(mock_post, mock_account):
+    mock_account.provider = "bluesky"
+    mock_account.platform_username = "@test.bsky.social"
+    mock_account.credentials = {
+        "handle": "test.bsky.social",
+        "app_password": "fake-app-password",
+        "pds_url": "https://bsky.social",
+    }
+    provider = BlueskyProvider(mock_account)
+
+    res_session = MagicMock()
+    res_session.status_code = 200
+    res_session.json.return_value = {
+        "accessJwt": "fake_jwt",
+        "did": "did:plc:12345",
+        "handle": "test.bsky.social",
+    }
+
+    res_record = MagicMock()
+    res_record.status_code = 200
+    res_record.json.return_value = {
+        "uri": "at://did:plc:12345/app.bsky.feed.post/3l7testexample",
+        "cid": "bafyreitest",
+    }
+
+    mock_post.side_effect = [res_session, res_record]
+
+    result = provider.send_test_message()
+    assert result["success"] is True
+    assert "3l7testexample" in result["message"]
+    assert (
+        result["url"] == "https://bsky.app/profile/test.bsky.social/post/3l7testexample"
+    )
+
+
+@patch("requests.post")
+def test_bluesky_publish_post_error(mock_post, mock_account):
+    mock_account.provider = "bluesky"
+    mock_account.platform_username = "@test.bsky.social"
+    mock_account.credentials = {
+        "handle": "test.bsky.social",
+        "app_password": "fake-app-password",
+        "pds_url": "https://bsky.social",
+    }
+    provider = BlueskyProvider(mock_account)
+
+    res_session = MagicMock()
+    res_session.status_code = 200
+    res_session.json.return_value = {
+        "accessJwt": "fake_jwt",
+        "did": "did:plc:12345",
+        "handle": "test.bsky.social",
+    }
+
+    res_record_err = MagicMock()
+    res_record_err.status_code = 400
+    res_record_err.json.return_value = {"message": "Post text too long"}
+
+    mock_post.side_effect = [res_session, res_record_err]
+
+    with pytest.raises(PublishingError, match="Bluesky post creation failed"):
+        provider.publish_post("text")
+
+
+def test_bluesky_publish_post_empty_text_error(mock_account):
+    mock_account.provider = "bluesky"
+    mock_account.credentials = {
+        "handle": "test.bsky.social",
+        "app_password": "fake-app-password",
+        "pds_url": "https://bsky.social",
+    }
+    provider = BlueskyProvider(mock_account)
+
+    with pytest.raises(PublishingError, match="Post text or media is required"):
+        provider.publish_post("   ")
+
+
+def test_bluesky_extract_atproto_facets_skips_overlapping_url_anchors():
+    text = "Read docs at https://eventyay.com/docs#setup and check #eventyay!"
+    facets = extract_atproto_facets(text)
+    # Should only extract 1 URL facet and 1 tag facet (#eventyay),
+    # skipping #setup in URL
+    assert len(facets) == 2
+    assert facets[0]["features"][0]["$type"] == "app.bsky.richtext.facet#link"
+    assert facets[0]["features"][0]["uri"] == "https://eventyay.com/docs#setup"
+    assert facets[1]["features"][0]["$type"] == "app.bsky.richtext.facet#tag"
+    assert facets[1]["features"][0]["tag"] == "eventyay"
+
+
+def test_bluesky_publish_post_exceeds_limits(mock_account):
+    mock_account.provider = "bluesky"
+    mock_account.credentials = {
+        "handle": "test.bsky.social",
+        "app_password": "fake-app-password",
+        "pds_url": "https://bsky.social",
+    }
+    provider = BlueskyProvider(mock_account)
+
+    long_text = "a" * 301
+    with pytest.raises(PublishingError, match="Post exceeds Bluesky limits"):
+        provider.publish_post(long_text)
+
+
+@patch("requests.post")
+def test_bluesky_publish_post_empty_text_and_no_embed(mock_post, mock_account):
+    mock_account.provider = "bluesky"
+    mock_account.credentials = {
+        "handle": "test.bsky.social",
+        "app_password": "fake-app-password",
+        "pds_url": "https://bsky.social",
+    }
+    provider = BlueskyProvider(mock_account)
+
+    res_session = MagicMock()
+    res_session.status_code = 200
+    res_session.json.return_value = {
+        "accessJwt": "fake_jwt",
+        "did": "did:plc:12345",
+        "handle": "test.bsky.social",
+    }
+    mock_post.return_value = res_session
+
+    # media contains only empty string so embed is None and text is empty
+    with pytest.raises(
+        PublishingError,
+        match="Bluesky post must contain non-empty text or a valid media attachment.",
+    ):
+        provider.publish_post("", media=[""])
+
+
+def test_bluesky_count_graphemes_zwj_sequence():
+    # Family emoji sequence: Woman + ZWJ + Woman + ZWJ + Girl + ZWJ + Boy
+    family = "👩‍👩‍👧‍👦"
+    assert _count_graphemes(family) == 1
+    assert _count_graphemes("👨‍⚕️") == 1
+    # 76 family emojis = 76 graphemes
+    assert _count_graphemes(family * 76) == 76
+
+
+def test_bluesky_extract_atproto_facets_preserves_exclamation_in_url():
+    text = "Visit https://example.test/docs#section! to read more."
+    facets = extract_atproto_facets(text)
+    assert len(facets) == 1
+    assert facets[0]["features"][0]["$type"] == "app.bsky.richtext.facet#link"
+    assert facets[0]["features"][0]["uri"] == "https://example.test/docs#section!"
+
+
+@patch("socket.getaddrinfo")
+@patch("requests.get")
+def test_safe_fetch_url_valid_redirect(mock_get, mock_getaddrinfo):
+    mock_getaddrinfo.return_value = [
+        (2, 1, 6, "", ("93.184.216.34", 0)),
+    ]
+
+    res_redir = MagicMock()
+    res_redir.is_redirect = True
+    res_redir.status_code = 302
+    res_redir.headers = {"Location": "https://example.com/target.png"}
+
+    res_final = MagicMock()
+    res_final.is_redirect = False
+    res_final.status_code = 200
+    res_final.iter_content.return_value = [b"image_content"]
+    res_final.apparent_encoding = "utf-8"
+
+    mock_get.side_effect = [res_redir, res_final]
+
+    resp = _safe_fetch_url("https://example.com/source.png")
+    assert resp._content == b"image_content"
+    assert mock_get.call_count == 2
+
+
+@patch("socket.getaddrinfo")
+@patch("requests.get")
+def test_safe_fetch_url_blocks_redirect_to_private_ip(mock_get, mock_getaddrinfo):
+    def fake_getaddrinfo(host, port):
+        if host == "public.com":
+            return [(2, 1, 6, "", ("93.184.216.34", 0))]
+        # Redirect destination points to internal metadata IP
+        return [(2, 1, 6, "", ("169.254.169.254", 0))]
+
+    mock_getaddrinfo.side_effect = fake_getaddrinfo
+
+    res_redir = MagicMock()
+    res_redir.is_redirect = True
+    res_redir.status_code = 302
+    res_redir.headers = {"Location": "http://internal-meta/latest"}
+
+    mock_get.return_value = res_redir
+
+    with pytest.raises(ValueError, match="blocked network"):
+        _safe_fetch_url("https://public.com/image.png")
+
+
+@patch("socket.getaddrinfo")
+@patch("requests.get")
+def test_safe_fetch_url_too_many_redirects(mock_get, mock_getaddrinfo):
+    mock_getaddrinfo.return_value = [(2, 1, 6, "", ("93.184.216.34", 0))]
+
+    res_redir = MagicMock()
+    res_redir.is_redirect = True
+    res_redir.status_code = 302
+    res_redir.headers = {"Location": "https://example.com/loop"}
+
+    mock_get.return_value = res_redir
+
+    with pytest.raises(ValueError, match="Too many redirects"):
+        _safe_fetch_url("https://example.com/loop", max_redirects=2)
+
+
+def test_bluesky_provider_rejects_private_ip_pds_url(mock_account):
+    mock_account.provider = "bluesky"
+    mock_account.credentials = {
+        "handle": "test.bsky.social",
+        "app_password": "fake-app-password",
+        "pds_url": "https://127.0.0.1:8000",
+    }
+    provider = BlueskyProvider(mock_account)
+    with pytest.raises(PublishingError, match="blocked network"):
+        provider._get_pds_url()
